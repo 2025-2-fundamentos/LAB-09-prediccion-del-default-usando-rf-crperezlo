@@ -92,3 +92,169 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import gzip
+import json
+import pickle
+
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+)
+
+TRAIN_PATH = "files/input/train_data.csv.zip"
+TEST_PATH = "files/input/test_data.csv.zip"
+MODEL_PATH = "files/models/model.pkl.gz"
+METRICS_PATH = "files/output/metrics.json"
+
+
+# Paso 1: limpieza del dataset
+
+def limpiar_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    # Renombrar columna objetivo
+    df = df.rename(columns={"default payment next month": "default"})
+
+    # Eliminar columna ID (si existe)
+    df = df.drop(columns=["ID"], errors="ignore")
+
+    # Eliminar filas con datos faltantes reales
+    df = df.dropna()
+
+    # Agrupar valores > 4 en EDUCATION como "others"
+    df["EDUCATION"] = df["EDUCATION"].apply(
+        lambda x: x if x in [0, 1, 2, 3, 4] else 4
+    )
+
+    return df
+
+
+# Paso 3: pipeline
+# 
+def build_pipeline() -> Pipeline:
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features)
+        ],
+        remainder="passthrough",  # deja el resto de columnas numéricas igual
+    )
+
+    rf = RandomForestClassifier(random_state=42)
+
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessing", preprocessor),
+            ("classifier", rf),
+        ]
+    )
+    return pipeline
+
+
+
+def calcular_metricas(y_true, y_pred, dataset_name):
+    return {
+        "type": "metrics",
+        "dataset": dataset_name,
+        "precision": precision_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1_score": f1_score(y_true, y_pred),
+    }
+
+
+def matriz_confusion_dict(y_true, y_pred, dataset_name):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_name,
+        "true_0": {
+            "predicted_0": int(cm[0, 0]),
+            "predicted_1": int(cm[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm[1, 0]),
+            "predicted_1": int(cm[1, 1]),
+        },
+    }
+
+
+
+def main():
+    #cargar datos
+    df_train = pd.read_csv(TRAIN_PATH, index_col=False, compression="zip")
+    df_test = pd.read_csv(TEST_PATH, index_col=False, compression="zip")
+
+    #Paso 1: limpieza
+    df_train_clean = limpiar_dataset(df_train)
+    df_test_clean = limpiar_dataset(df_test)
+
+    #Paso 2: separar X e y
+    X_train = df_train_clean.drop(columns="default")
+    y_train = df_train_clean["default"]
+
+    X_test = df_test_clean.drop(columns="default")
+    y_test = df_test_clean["default"]
+
+    #Paso 3: pipeline
+    pipeline = build_pipeline()
+
+    #Paso 4: GridSearchCV con scoring balanced_accuracy y 10-fold CV
+    param_grid = {
+        "classifier__n_estimators": [200, 300],
+        "classifier__max_depth": [15, 20, None],
+        "classifier__min_samples_split": [2, 4],
+        "classifier__min_samples_leaf": [1, 2],
+    }
+
+    grid_search = GridSearchCV(
+        pipeline,
+        param_grid=param_grid,
+        scoring="balanced_accuracy",
+        cv=10,
+        n_jobs=-1,
+        verbose=1,
+    )
+
+    grid_search.fit(X_train, y_train)
+
+    #Paso 5: guardar el GridSearchCV 
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    with gzip.open(MODEL_PATH, "wb") as f:
+        pickle.dump(grid_search, f)
+
+    #Predicciones para train y test
+    y_pred_train = grid_search.predict(X_train)
+    y_pred_test = grid_search.predict(X_test)
+
+    #Paso 6: métricas
+    metrics = [
+        calcular_metricas(y_train, y_pred_train, "train"),
+        calcular_metricas(y_test, y_pred_test, "test"),
+    ]
+
+    #Paso 7: matrices de confusión
+    metrics.append(matriz_confusion_dict(y_train, y_pred_train, "train"))
+    metrics.append(matriz_confusion_dict(y_test, y_pred_test, "test"))
+
+    # Guardar metrics.json
+    os.makedirs(os.path.dirname(METRICS_PATH), exist_ok=True)
+    with open(METRICS_PATH, "w") as f:
+        for row in metrics:
+            json.dump(row, f)
+            f.write("\n")
+
+
+if __name__ == "__main__":
+    main()
